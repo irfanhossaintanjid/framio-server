@@ -1,6 +1,7 @@
 
 
 import { MongoClient, ObjectId } from 'mongodb';
+import { createRemoteJWKSet, jwtVerify } from "jose";
 import express from "express";
 import cors from "cors";
 import 'dotenv/config'
@@ -35,13 +36,68 @@ function sendError(res, status, message) {
   return res.status(status).json({ error: message });
 }
 
+let authJwks;
 
-app.post("/add-studios", async (req,res) => {
+async function verifyToken(req, res, next) {
+  const authUrl = String(process.env.CLIENT_URL ?? "").replace(/\/+$/, "");
+  const authorization = req.get("authorization") ?? "";
+  const token = authorization.startsWith("Bearer ")
+    ? authorization.slice(7).trim()
+    : "";
+
+  if (!token) return sendError(res, 401, "Please sign in first");
+  if (!authUrl) return sendError(res, 503, "Authentication is not configured");
+
   try {
-    
-   const studiosData = req.body;
-   const result = await studiocollection.insertOne(studiosData);
-   res.send(result);
+    if (!authJwks) {
+      authJwks = createRemoteJWKSet(new URL("/api/auth/jwks", `${authUrl}/`));
+    }
+
+    const { payload } = await jwtVerify(token, authJwks, {
+      issuer: authUrl,
+      audience: authUrl,
+    });
+    if (!payload.sub || typeof payload.email !== "string") {
+      return sendError(res, 401, "Invalid authentication token");
+    }
+
+    req.user = {
+      id: payload.sub,
+      email: payload.email.trim().toLowerCase(),
+      name: typeof payload.name === "string" ? payload.name : "",
+      image: typeof payload.image === "string" ? payload.image : "",
+    };
+    return next();
+  } catch {
+    return sendError(res, 401, "Invalid or expired authentication token");
+  }
+}
+
+function getStudioUser(req, res) {
+  if (!req.user?.email) {
+    sendError(res, 401, "A signed-in user is required");
+    return null;
+  }
+
+  return req.user;
+}
+
+
+
+app.post("/add-studios", verifyToken, async (req, res) => {
+  const user = getStudioUser(req, res);
+  if (!user) return;
+
+  try {
+    const studioData = {
+      ...req.body,
+      ownerEmail: user.email,
+      ownerName: user.name,
+      ownerImage: user.image,
+      createdAt: new Date().toISOString(),
+    };
+    const result = await studiocollection.insertOne(studioData);
+    return res.status(201).json(result);
   } catch (err) {
     console.error(err);
     res.status(500).send("Error inserting data into MongoDB");
@@ -52,12 +108,8 @@ app.post("/add-studios", async (req,res) => {
 
 app.get("/allStudios", async (req,res) => {
   try { 
-    const requestedLimit = Number.parseInt(String(req.query.limit ?? ""), 10);
-    const cursor = studiocollection.find();
-    const result = Number.isInteger(requestedLimit) && requestedLimit > 0
-      ? await cursor.limit(requestedLimit).toArray()
-      : await cursor.toArray();
-    res.send(result);
+    const result = await studiocollection.find().toArray();
+    return res.json(result);
   } catch (err) {
     console.error(err);
     res.status(500).send("Error retrieving data from MongoDB");
@@ -83,21 +135,30 @@ app.get("/studio/:id", async (req, res) => {
 //http://localhost:8000/studios/:id
 
 
-app.patch("/studio/:id", async (req, res) => {
+app.patch("/studio/:id", verifyToken, async (req, res) => {
+  const user = getStudioUser(req, res);
+  if (!user) return;
+
   try {
     const { id } = req.params;
     if (!isValidId(id)) return sendError(res, 400, "Invalid studio ID");
 
+    const studioData = { ...req.body };
+    delete studioData._id;
+    delete studioData.ownerEmail;
+    delete studioData.ownerName;
+    delete studioData.ownerImage;
+
     const result = await studiocollection.updateOne(
-      { _id: new ObjectId(id) },
-      { $set: req.body },
+      { _id: new ObjectId(id), ownerEmail: user.email },
+      { $set: { ...studioData, updatedAt: new Date().toISOString() } },
     );
 
     if (result.matchedCount === 0) {
       return sendError(res, 404, "Studio not found");
     }
 
-    return res.json(result);
+    return res.json({ message: "Studio updated successfully" });
   } catch (error) {
     console.error(error);
     return sendError(res, 500, "Failed to update studio");
@@ -110,6 +171,288 @@ app.patch("/studio/:id", async (req, res) => {
 
 
 
+
+
+
+// Studio listings that belong to one host.
+app.get("/my-studios", verifyToken, async (req, res) => {
+  const user = getStudioUser(req, res);
+  if (!user) return;
+
+  try {
+    const studios = await studiocollection
+      .find({ ownerEmail: user.email })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    return res.json(studios);
+  } catch (error) {
+    console.error(error);
+    return sendError(res, 500, "Failed to retrieve host studios");
+  }
+});
+
+// Delete a listing only when the email matches its owner.
+app.delete("/studio/:id", verifyToken, async (req, res) => {
+  const user = getStudioUser(req, res);
+  if (!user) return;
+
+  try {
+    const { id } = req.params;
+    if (!isValidId(id)) return sendError(res, 400, "Invalid studio ID");
+
+    const result = await studiocollection.deleteOne({
+      _id: new ObjectId(id),
+      ownerEmail: user.email,
+    });
+    if (result.deletedCount === 0) {
+      return sendError(res, 404, "Studio not found or you are not its owner");
+    }
+
+    return res.json({ deleted: true });
+  } catch (error) {
+    console.error(error);
+    return sendError(res, 500, "Failed to delete studio");
+  }
+});
+
+const bookingCollection = db.collection("bookings");
+
+function getBookingUser(req, res) {
+  if (!req.user?.email) {
+    sendError(res, 401, "A signed-in user is required");
+    return null;
+  }
+
+  return {
+    email: req.user.email,
+    name: req.user.name,
+  };
+}
+
+function sameEmail(first, second) {
+  return String(first ?? "").trim().toLowerCase() === String(second ?? "").trim().toLowerCase();
+}
+
+function serializeBooking(booking, studio) {
+  return {
+    ...booking,
+    _id: booking._id.toString(),
+    studio: studio ? { ...studio, _id: studio._id.toString() } : null,
+  };
+}
+
+async function getBookingWithStudio(booking) {
+  const studio = isValidId(booking.studioId)
+    ? await studiocollection.findOne({ _id: new ObjectId(booking.studioId) })
+    : null;
+  return serializeBooking(booking, studio);
+}
+
+function validDate(value) {
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const date = new Date(`${value}T00:00:00.000Z`);
+  return !Number.isNaN(date.getTime()) && date.toISOString().slice(0, 10) === value;
+}
+
+function validTime(value) {
+  if (typeof value !== "string" || !/^([01]\d|2[0-3]):[0-5]\d$/.test(value)) return false;
+  return true;
+}
+
+// A customer asks to book a studio.
+app.post("/booking", verifyToken, async (req, res) => {
+  const user = getBookingUser(req, res);
+  if (!user) return;
+
+  try {
+    const bookingData = req.body ?? {};
+    const { studioId, date, startTime, endTime, endAt } = bookingData;
+    if (!isValidId(studioId)) return sendError(res, 400, "A valid studio ID is required");
+    if (!validDate(date) || !validTime(startTime) || !validTime(endTime)) {
+      return sendError(res, 400, "A valid date and start/end times are required");
+    }
+
+    const scheduledEnd = typeof endAt === "string"
+      ? new Date(endAt)
+      : new Date(`${date}T${endTime}:00`);
+    if (!Number.isFinite(scheduledEnd.getTime())) {
+      return sendError(res, 400, "A valid booking end time is required");
+    }
+    const startMinutes = Number(startTime.slice(0, 2)) * 60 + Number(startTime.slice(3));
+    const endMinutes = Number(endTime.slice(0, 2)) * 60 + Number(endTime.slice(3));
+    if (endMinutes <= startMinutes) return sendError(res, 400, "End time must be after start time");
+
+    const studio = await studiocollection.findOne({ _id: new ObjectId(studioId) });
+    if (!studio) return sendError(res, 404, "Studio not found");
+    if (sameEmail(studio.ownerEmail, user.email)) {
+      return sendError(res, 400, "You cannot book your own studio");
+    }
+
+    const durationHours = (endMinutes - startMinutes) / 60;
+    const hourlyRate = Number(studio.hourlyRate ?? 0);
+    const securityDeposit = Number(studio.securityDeposit ?? 0);
+    const minimumDuration = Number(studio.minimumDuration ?? 1);
+    if (!Number.isFinite(hourlyRate) || hourlyRate < 0 || !Number.isFinite(securityDeposit) || securityDeposit < 0) {
+      return sendError(res, 400, "Studio pricing is invalid");
+    }
+    if (durationHours < minimumDuration) {
+      return sendError(res, 400, `This studio requires at least ${minimumDuration} hours`);
+    }
+
+    const conflict = await bookingCollection.findOne({
+      studioId,
+      date,
+      status: { $ne: "Cancelled" },
+      startTime: { $lt: endTime },
+      endTime: { $gt: startTime },
+    });
+    if (conflict) return sendError(res, 409, "This time slot is already booked");
+
+    // The form sends only the studio and requested time. Build the saved booking
+    // from values checked here and the signed-in user.
+    const bookingId = new ObjectId();
+    const bookingReference = `FR-${bookingId.toString().slice(-8).toUpperCase()}`;
+    await bookingCollection.insertOne(booking);
+    return res.status(201).json(await getBookingWithStudio(booking));
+  } catch (error) {
+    console.error(error);
+    return sendError(res, 500, "Failed to create booking");
+  }
+});
+
+// A customer reads their bookings.
+app.get("/my-booking", verifyToken, async (req, res) => {
+  const user = getBookingUser(req, res);
+  if (!user) return;
+
+  try {
+    const bookings = await bookingCollection
+      .find({ customerEmail: user.email })
+      .sort({ createdAt: -1 })
+      .toArray();
+    return res.json(await Promise.all(bookings.map(getBookingWithStudio)));
+  } catch (error) {
+    console.error(error);
+    return sendError(res, 500, "Failed to retrieve bookings");
+  }
+});
+
+// A host reads bookings for their studios.
+app.get("/host-bookings", verifyToken, async (req, res) => {
+  const user = getBookingUser(req, res);
+  if (!user) return;
+
+  try {
+    const ownerEmailPattern = `^${user.email.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`;
+    const studios = await studiocollection
+      .find({ ownerEmail: { $regex: ownerEmailPattern, $options: "i" } })
+      .project({ _id: 1 })
+      .toArray();
+    res.set("x-framio-has-studios", studios.length > 0 ? "true" : "false");
+    const studioIds = studios.map((studio) => studio._id.toString());
+    if (studioIds.length === 0) return res.json([]);
+
+    const bookings = await bookingCollection
+      .find({
+        $or: [
+          { studioId: { $in: [...studioIds, ...studios.map((studio) => studio._id)] } },
+          { ownerEmail: { $regex: ownerEmailPattern, $options: "i" } },
+        ],
+      })
+      .sort({ createdAt: -1 })
+      .toArray();
+    return res.json(await Promise.all(bookings.map(getBookingWithStudio)));
+  } catch (error) {
+    console.error(error);
+    return sendError(res, 500, "Failed to retrieve host bookings");
+  }
+});
+
+// Hosts confirm bookings. Customers can cancel their pending bookings.
+// Hosts can mark confirmed bookings as completed.
+app.patch("/booking/:id/:action", verifyToken, async (req, res) => {
+  const user = getBookingUser(req, res);
+  if (!user) return;
+
+  try {
+    const { id, action } = req.params;
+    if (!isValidId(id)) return sendError(res, 400, "Invalid booking ID");
+    if (!["confirm", "cancel", "complete"].includes(action)) return sendError(res, 404, "Booking action not found");
+
+    const booking = await bookingCollection.findOne({ _id: new ObjectId(id) });
+    if (!booking) return sendError(res, 404, "Booking not found");
+
+    const isCustomer = sameEmail(booking.customerEmail, user.email);
+    const isHost = sameEmail(booking.ownerEmail, user.email);
+
+    if (action === "confirm" && !isHost) {
+      return sendError(res, 403, "Only the studio host can confirm this booking");
+    }
+    if (action === "cancel" && !isCustomer && !isHost) {
+      return sendError(res, 403, "You cannot cancel this booking");
+    }
+    if (action === "complete" && !isHost) {
+      return sendError(res, 403, "Only the studio host can complete this booking");
+    }
+
+    let requiredStatus = "Pending";
+    if (action === "complete") {
+      requiredStatus = "Confirmed";
+    }
+
+    if (booking.status !== requiredStatus) {
+      return sendError(res, 409, `Only ${requiredStatus.toLowerCase()} bookings can be changed this way`);
+    }
+
+    const now = new Date().toISOString();
+    let update = {};
+    if (action === "confirm") {
+      update = { status: "Confirmed", confirmedAt: now };
+    } else if (action === "complete") {
+      update = { status: "Completed", completedAt: now };
+    } else {
+      update = { status: "Cancelled", cancelledAt: now };
+    }
+
+    const updateResult = await bookingCollection.updateOne(
+      { _id: booking._id, status: requiredStatus },
+      { $set: update },
+    );
+    if (updateResult.matchedCount === 0) {
+      return sendError(res, 409, "This booking was already changed");
+    }
+
+    const updatedBooking = { ...booking, ...update };
+    return res.json(await getBookingWithStudio(updatedBooking));
+  } catch (error) {
+    console.error(error);
+    return sendError(res, 500, "Failed to update booking");
+  }
+});
+
+// Return booking details used by the frontend to create its PDF invoice.
+app.get("/booking/:id/invoice", verifyToken, async (req, res) => {
+  const user = getBookingUser(req, res);
+  if (!user) return;
+
+  try {
+    const { id } = req.params;
+    if (!isValidId(id)) return sendError(res, 400, "Invalid booking ID");
+    const booking = await bookingCollection.findOne({ _id: new ObjectId(id) });
+    if (!booking) return sendError(res, 404, "Booking not found");
+    if (!sameEmail(booking.ownerEmail, user.email) && !sameEmail(booking.customerEmail, user.email)) {
+      return sendError(res, 403, "You cannot view this invoice");
+    }
+    if (!["Confirmed", "Completed"].includes(booking.status)) {
+      return sendError(res, 409, "Invoices are available for confirmed bookings");
+    }
+    return res.json(await getBookingWithStudio(booking));
+  } catch (error) {
+    console.error(error);
+    return sendError(res, 500, "Failed to retrieve invoice");
+  }
+});
 
 
 app.listen(PORT, ()=> {
