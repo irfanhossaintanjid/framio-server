@@ -1,9 +1,9 @@
 
 
 import { MongoClient, ObjectId } from 'mongodb';
-import { createRemoteJWKSet, jwtVerify } from "jose";
 import express from "express";
 import cors from "cors";
+import { createRemoteJWKSet, jwtVerify } from "jose";
 import 'dotenv/config'
 
 const app = express();
@@ -38,7 +38,7 @@ function sendError(res, status, message) {
 
 let authJwks;
 
-async function verifyToken(req, res, next) {
+const verifyToken = async (req, res, next) => {
   const authUrl = String(process.env.CLIENT_URL ?? "").replace(/\/+$/, "");
   const authorization = req.get("authorization") ?? "";
   const token = authorization.startsWith("Bearer ")
@@ -68,23 +68,19 @@ async function verifyToken(req, res, next) {
       image: typeof payload.image === "string" ? payload.image : "",
     };
     return next();
-  } catch {
+  } catch (error) {
+    console.error("JWT verification failed:", error);
     return sendError(res, 401, "Invalid or expired authentication token");
   }
-}
+};
 
-function getStudioUser(req, res) {
-  if (!req.user?.email) {
-    sendError(res, 401, "A signed-in user is required");
-    return null;
-  }
-
-  return req.user;
+function getStudioUser(req) {
+  return req.user ?? null;
 }
 
 
 
-app.post("/add-studios", verifyToken, async (req, res) => {
+app.post("/add-studios",verifyToken, async (req, res) => {
   const user = getStudioUser(req, res);
   if (!user) return;
 
@@ -135,7 +131,7 @@ app.get("/studio/:id", async (req, res) => {
 //http://localhost:8000/studios/:id
 
 
-app.patch("/studio/:id", verifyToken, async (req, res) => {
+app.patch("/studio/:id",verifyToken, async (req, res) => {
   const user = getStudioUser(req, res);
   if (!user) return;
 
@@ -217,17 +213,14 @@ app.delete("/studio/:id", verifyToken, async (req, res) => {
 });
 
 const bookingCollection = db.collection("bookings");
+const bookingSlotsCollection = db.collection("bookingSlots");
+await bookingSlotsCollection.createIndex(
+  { studioId: 1, date: 1, hour: 1 },
+  { unique: true, name: "unique_studio_date_hour" },
+);
 
-function getBookingUser(req, res) {
-  if (!req.user?.email) {
-    sendError(res, 401, "A signed-in user is required");
-    return null;
-  }
-
-  return {
-    email: req.user.email,
-    name: req.user.name,
-  };
+function getBookingUser(req) {
+  return req.user ?? null;
 }
 
 function sameEmail(first, second) {
@@ -267,21 +260,22 @@ app.post("/booking", verifyToken, async (req, res) => {
 
   try {
     const bookingData = req.body ?? {};
-    const { studioId, date, startTime, endTime, endAt } = bookingData;
+    const { studioId, date, startTime, endTime } = bookingData;
     if (!isValidId(studioId)) return sendError(res, 400, "A valid studio ID is required");
     if (!validDate(date) || !validTime(startTime) || !validTime(endTime)) {
       return sendError(res, 400, "A valid date and start/end times are required");
     }
 
-    const scheduledEnd = typeof endAt === "string"
-      ? new Date(endAt)
-      : new Date(`${date}T${endTime}:00`);
+    const scheduledEnd = new Date(`${date}T${endTime}:00.000Z`);
     if (!Number.isFinite(scheduledEnd.getTime())) {
       return sendError(res, 400, "A valid booking end time is required");
     }
     const startMinutes = Number(startTime.slice(0, 2)) * 60 + Number(startTime.slice(3));
     const endMinutes = Number(endTime.slice(0, 2)) * 60 + Number(endTime.slice(3));
     if (endMinutes <= startMinutes) return sendError(res, 400, "End time must be after start time");
+    if (startMinutes % 60 !== 0 || endMinutes % 60 !== 0) {
+      return sendError(res, 400, "Bookings must start and end on the hour");
+    }
 
     const studio = await studiocollection.findOne({ _id: new ObjectId(studioId) });
     if (!studio) return sendError(res, 404, "Studio not found");
@@ -313,7 +307,54 @@ app.post("/booking", verifyToken, async (req, res) => {
     // from values checked here and the signed-in user.
     const bookingId = new ObjectId();
     const bookingReference = `FR-${bookingId.toString().slice(-8).toUpperCase()}`;
-    await bookingCollection.insertOne(booking);
+    const confirmedAt = new Date().toISOString();
+    const booking = {
+      _id: bookingId,
+      bookingReference,
+      invoiceNumber: `INV-${bookingReference}`,
+      studioId,
+      date,
+      startTime,
+      endTime,
+      endAt: scheduledEnd.toISOString(),
+      durationHours,
+      hourlyRate,
+      hourlyAmount: hourlyRate * durationHours,
+      securityDeposit,
+      totalAmount: hourlyRate * durationHours + securityDeposit,
+      title: studio.title ?? "Studio",
+      coverImageUrl: studio.coverImageUrl ?? "",
+      category: studio.category ?? "",
+      address: studio.address ?? "",
+      status: "Confirmed",
+      confirmedAt,
+      customerName: user.name,
+      customerEmail: user.email,
+      ownerName: studio.ownerName ?? "",
+      ownerEmail: String(studio.ownerEmail ?? "").trim().toLowerCase(),
+      createdAt: confirmedAt,
+    };
+
+    const slots = [];
+    for (let hour = startMinutes / 60; hour < endMinutes / 60; hour += 1) {
+      slots.push({ studioId, date, hour, bookingId: bookingId.toString() });
+    }
+
+    const session = client.startSession();
+    try {
+      await session.withTransaction(async () => {
+        await bookingSlotsCollection.insertMany(slots, { session });
+        await bookingCollection.insertOne(booking, { session });
+      });
+    } catch (error) {
+      if (error?.code === 11000) {
+        return sendError(res, 409, "This time slot is already booked");
+      }
+      throw error;
+    } finally {
+      await session.endSession();
+    }
+
     return res.status(201).json(await getBookingWithStudio(booking));
   } catch (error) {
     console.error(error);
@@ -397,11 +438,13 @@ app.patch("/booking/:id/:action", verifyToken, async (req, res) => {
     }
 
     let requiredStatus = "Pending";
-    if (action === "complete") {
-      requiredStatus = "Confirmed";
-    }
-
-    if (booking.status !== requiredStatus) {
+    if (action === "complete") requiredStatus = "Confirmed";
+    if (action === "cancel") {
+      if (!["Pending", "Confirmed"].includes(booking.status)) {
+        return sendError(res, 409, "Only pending or confirmed bookings can be cancelled");
+      }
+      requiredStatus = booking.status;
+    } else if (booking.status !== requiredStatus) {
       return sendError(res, 409, `Only ${requiredStatus.toLowerCase()} bookings can be changed this way`);
     }
 
@@ -415,10 +458,32 @@ app.patch("/booking/:id/:action", verifyToken, async (req, res) => {
       update = { status: "Cancelled", cancelledAt: now };
     }
 
-    const updateResult = await bookingCollection.updateOne(
-      { _id: booking._id, status: requiredStatus },
-      { $set: update },
-    );
+    let updateResult;
+    if (action === "cancel") {
+      const session = client.startSession();
+      try {
+        await session.withTransaction(async () => {
+          updateResult = await bookingCollection.updateOne(
+            { _id: booking._id, status: requiredStatus },
+            { $set: update },
+            { session },
+          );
+          if (updateResult.matchedCount > 0) {
+            await bookingSlotsCollection.deleteMany(
+              { bookingId: booking._id.toString() },
+              { session },
+            );
+          }
+        });
+      } finally {
+        await session.endSession();
+      }
+    } else {
+      updateResult = await bookingCollection.updateOne(
+        { _id: booking._id, status: requiredStatus },
+        { $set: update },
+      );
+    }
     if (updateResult.matchedCount === 0) {
       return sendError(res, 409, "This booking was already changed");
     }
