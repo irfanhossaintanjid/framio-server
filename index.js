@@ -32,6 +32,14 @@ function isValidId(id) {
   return typeof id === "string" && /^[a-f\d]{24}$/i.test(id);
 }
 
+function isValidHourlyRate(value) {
+  if (typeof value !== "number" && typeof value !== "string") return false;
+  if (typeof value === "string" && value.trim() === "") return false;
+
+  const hourlyRate = Number(value);
+  return Number.isFinite(hourlyRate) && hourlyRate >= 0;
+}
+
 function sendError(res, status, message) {
   return res.status(status).json({ error: message });
 }
@@ -85,6 +93,10 @@ app.post("/add-studios",verifyToken, async (req, res) => {
   if (!user) return;
 
   try {
+    if (!isValidHourlyRate(req.body?.hourlyRate)) {
+      return sendError(res, 400, "A valid hourly rate is required");
+    }
+
     const studioData = {
       ...req.body,
       ownerEmail: user.email,
@@ -144,6 +156,19 @@ app.patch("/studio/:id",verifyToken, async (req, res) => {
     delete studioData.ownerEmail;
     delete studioData.ownerName;
     delete studioData.ownerImage;
+
+    const existingStudio = await studiocollection.findOne(
+      { _id: new ObjectId(id), ownerEmail: user.email },
+      { projection: { hourlyRate: 1 } },
+    );
+    if (!existingStudio) return sendError(res, 404, "Studio not found");
+
+    const hourlyRate = Object.prototype.hasOwnProperty.call(studioData, "hourlyRate")
+      ? studioData.hourlyRate
+      : existingStudio.hourlyRate;
+    if (!isValidHourlyRate(hourlyRate)) {
+      return sendError(res, 400, "A valid hourly rate is required");
+    }
 
     const result = await studiocollection.updateOne(
       { _id: new ObjectId(id), ownerEmail: user.email },
@@ -218,6 +243,15 @@ await bookingSlotsCollection.createIndex(
   { studioId: 1, date: 1, hour: 1 },
   { unique: true, name: "unique_studio_date_hour" },
 );
+const inactiveBookings = await bookingCollection
+  .find({ status: { $in: ["Completed", "Cancelled"] } })
+  .project({ _id: 1 })
+  .toArray();
+if (inactiveBookings.length > 0) {
+  await bookingSlotsCollection.deleteMany({
+    bookingId: { $in: inactiveBookings.map((booking) => booking._id.toString()) },
+  });
+}
 
 function getBookingUser(req) {
   return req.user ?? null;
@@ -242,6 +276,36 @@ async function getBookingWithStudio(booking) {
   return serializeBooking(booking, studio);
 }
 
+async function completeExpiredBookings() {
+  const now = new Date().toISOString();
+  const expiredFilter = { status: "Confirmed", endAt: { $lte: now } };
+  const expiredBookings = await bookingCollection
+    .find(expiredFilter)
+    .project({ _id: 1 })
+    .toArray();
+  if (expiredBookings.length === 0) return;
+
+  const bookingIds = expiredBookings.map((booking) => booking._id.toString());
+  const session = client.startSession();
+  try {
+    await session.withTransaction(async () => {
+      const result = await bookingCollection.updateMany(
+        expiredFilter,
+        { $set: { status: "Completed", completedAt: now } },
+        { session },
+      );
+      if (result.modifiedCount > 0) {
+        await bookingSlotsCollection.deleteMany(
+          { bookingId: { $in: bookingIds } },
+          { session },
+        );
+      }
+    });
+  } finally {
+    await session.endSession();
+  }
+}
+
 function validDate(value) {
   if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
   const date = new Date(`${value}T00:00:00.000Z`);
@@ -260,13 +324,15 @@ app.post("/booking", verifyToken, async (req, res) => {
 
   try {
     const bookingData = req.body ?? {};
-    const { studioId, date, startTime, endTime } = bookingData;
+    const { studioId, date, startTime, endTime, endAt } = bookingData;
     if (!isValidId(studioId)) return sendError(res, 400, "A valid studio ID is required");
     if (!validDate(date) || !validTime(startTime) || !validTime(endTime)) {
       return sendError(res, 400, "A valid date and start/end times are required");
     }
 
-    const scheduledEnd = new Date(`${date}T${endTime}:00.000Z`);
+    const scheduledEnd = typeof endAt === "string"
+      ? new Date(endAt)
+      : new Date(`${date}T${endTime}:00.000Z`);
     if (!Number.isFinite(scheduledEnd.getTime())) {
       return sendError(res, 400, "A valid booking end time is required");
     }
@@ -297,7 +363,7 @@ app.post("/booking", verifyToken, async (req, res) => {
     const conflict = await bookingCollection.findOne({
       studioId,
       date,
-      status: { $ne: "Cancelled" },
+      status: { $in: ["Pending", "Confirmed"] },
       startTime: { $lt: endTime },
       endTime: { $gt: startTime },
     });
@@ -307,7 +373,7 @@ app.post("/booking", verifyToken, async (req, res) => {
     // from values checked here and the signed-in user.
     const bookingId = new ObjectId();
     const bookingReference = `FR-${bookingId.toString().slice(-8).toUpperCase()}`;
-    const confirmedAt = new Date().toISOString();
+    const createdAt = new Date().toISOString();
     const booking = {
       _id: bookingId,
       bookingReference,
@@ -326,13 +392,12 @@ app.post("/booking", verifyToken, async (req, res) => {
       coverImageUrl: studio.coverImageUrl ?? "",
       category: studio.category ?? "",
       address: studio.address ?? "",
-      status: "Confirmed",
-      confirmedAt,
+      status: "Pending",
       customerName: user.name,
       customerEmail: user.email,
       ownerName: studio.ownerName ?? "",
       ownerEmail: String(studio.ownerEmail ?? "").trim().toLowerCase(),
-      createdAt: confirmedAt,
+      createdAt,
     };
 
     const slots = [];
@@ -368,6 +433,7 @@ app.get("/my-booking", verifyToken, async (req, res) => {
   if (!user) return;
 
   try {
+    await completeExpiredBookings();
     const bookings = await bookingCollection
       .find({ customerEmail: user.email })
       .sort({ createdAt: -1 })
@@ -379,39 +445,7 @@ app.get("/my-booking", verifyToken, async (req, res) => {
   }
 });
 
-// A host reads bookings for their studios.
-app.get("/host-bookings", verifyToken, async (req, res) => {
-  const user = getBookingUser(req, res);
-  if (!user) return;
-
-  try {
-    const ownerEmailPattern = `^${user.email.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`;
-    const studios = await studiocollection
-      .find({ ownerEmail: { $regex: ownerEmailPattern, $options: "i" } })
-      .project({ _id: 1 })
-      .toArray();
-    res.set("x-framio-has-studios", studios.length > 0 ? "true" : "false");
-    const studioIds = studios.map((studio) => studio._id.toString());
-    if (studioIds.length === 0) return res.json([]);
-
-    const bookings = await bookingCollection
-      .find({
-        $or: [
-          { studioId: { $in: [...studioIds, ...studios.map((studio) => studio._id)] } },
-          { ownerEmail: { $regex: ownerEmailPattern, $options: "i" } },
-        ],
-      })
-      .sort({ createdAt: -1 })
-      .toArray();
-    return res.json(await Promise.all(bookings.map(getBookingWithStudio)));
-  } catch (error) {
-    console.error(error);
-    return sendError(res, 500, "Failed to retrieve host bookings");
-  }
-});
-
-// Hosts confirm bookings. Customers can cancel their pending bookings.
-// Hosts can mark confirmed bookings as completed.
+// Customers confirm or cancel pending bookings and manage their confirmed bookings.
 app.patch("/booking/:id/:action", verifyToken, async (req, res) => {
   const user = getBookingUser(req, res);
   if (!user) return;
@@ -425,16 +459,16 @@ app.patch("/booking/:id/:action", verifyToken, async (req, res) => {
     if (!booking) return sendError(res, 404, "Booking not found");
 
     const isCustomer = sameEmail(booking.customerEmail, user.email);
-    const isHost = sameEmail(booking.ownerEmail, user.email);
-
-    if (action === "confirm" && !isHost) {
-      return sendError(res, 403, "Only the studio host can confirm this booking");
+    if (!isCustomer) {
+      return sendError(res, 403, "Only the customer who made this booking can manage it");
     }
-    if (action === "cancel" && !isCustomer && !isHost) {
-      return sendError(res, 403, "You cannot cancel this booking");
-    }
-    if (action === "complete" && !isHost) {
-      return sendError(res, 403, "Only the studio host can complete this booking");
+    if (action === "complete") {
+      const scheduledEnd = booking.endAt
+        ? new Date(booking.endAt).getTime()
+        : new Date(`${booking.date}T${booking.endTime}:00.000Z`).getTime();
+      if (!Number.isFinite(scheduledEnd) || scheduledEnd > Date.now()) {
+        return sendError(res, 409, "This booking can be completed after its scheduled end time");
+      }
     }
 
     let requiredStatus = "Pending";
@@ -459,7 +493,7 @@ app.patch("/booking/:id/:action", verifyToken, async (req, res) => {
     }
 
     let updateResult;
-    if (action === "cancel") {
+    if (action === "cancel" || action === "complete") {
       const session = client.startSession();
       try {
         await session.withTransaction(async () => {
